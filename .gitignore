@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# virtual environments
+zk_env/
+venv/
+.env/
+
+# logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
