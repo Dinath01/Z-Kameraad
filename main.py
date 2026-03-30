@@ -1,27 +1,29 @@
-from fastapi import FastAPI
-from auth_routes import router as auth_router
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from typing import List
 from datetime import datetime
+import time
+
+from auth_routes import router as auth_router
 from predict_routes import router as predict_router
-from fastapi import HTTPException
 from match_routes import router as match_router
 from chat_routes import router as chat_router
+
 from state import active_chats, pending_requests, online_peers, chat_messages
+from ml_model import predict_burnout
 
 
+# Initialize FastAPI app
 app = FastAPI(title="Z Kameraad Burnout API")
 
-from predict_routes import router as predict_router
-
+# Register route modules
 app.include_router(predict_router)
-
 app.include_router(auth_router)
-
 app.include_router(match_router)
-
 app.include_router(chat_router)
 
+
+# Request / Response Models
 
 class BurnoutRequest(BaseModel):
     text: str
@@ -31,6 +33,7 @@ class BurnoutResponse(BaseModel):
     burnout_level: int
     burnout_meaning: str
     confidence: List[float]
+    response_time: float
 
 
 class PeerAvailabilityRequest(BaseModel):
@@ -47,12 +50,29 @@ class MatchAcceptRequest(BaseModel):
     peer_id: str
     user_id: str
 
+
 class EndChatRequest(BaseModel):
     chat_id: str
     ended_by: str
 
 
+class ChatMessageRequest(BaseModel):
+    chat_id: str
+    sender_id: str
+    text: str
+
+
+class FeedbackRequest(BaseModel):
+    chat_id: str
+    from_role: str
+    rating: int
+    comment: str | None = None
+
+
+# Utility Functions
+
 def map_label(label: int) -> str:
+    """Convert numeric burnout level to human-readable text."""
     return {
         0: "No burnout detected",
         1: "Mild burnout detected",
@@ -60,24 +80,52 @@ def map_label(label: int) -> str:
     }.get(label, "Unknown")
 
 
+# Root Endpoint
+
 @app.get("/")
 def root():
     return {"status": "Z Kameraad backend running"}
 
+
+# Burnout Prediction
+
 @app.post("/predict", response_model=BurnoutResponse)
-def predict_burnout(request: BurnoutRequest):
-    result = burnout_model.predict(request.text)
-    label = result["label"]
+def predict_burnout_route(request: BurnoutRequest):
+    start = time.time()
+
+    result = predict_burnout(request.text)
+
+    # Handle different model return formats
+    if isinstance(result, dict):
+        label_text = result["label"]
+        confidence = result["confidence"]
+    else:
+        label_text = result
+        confidence = 0.9  # fallback
+
+    label_map = {
+        "low": 1,
+        "medium": 2,
+        "high": 3
+    }
+
+    label = label_map.get(label_text, 0)
+
+    end = time.time()
 
     return {
         "burnout_level": label,
-        "burnout_meaning": map_label(label),
-        "confidence": result["confidence"],
+        "burnout_meaning": label_text,
+        "confidence": float(confidence),
+        "response_time": end - start
     }
 
 
+# Peer Availability
+
 @app.post("/peer/availability")
 def set_peer_availability(data: PeerAvailabilityRequest):
+    """Mark a peer as online or offline."""
     if data.online:
         online_peers.add(data.peer_id)
     else:
@@ -90,25 +138,35 @@ def set_peer_availability(data: PeerAvailabilityRequest):
     }
 
 
+# Matching System
+
 @app.post("/match/request")
 def request_peer(data: MatchRequest):
+    """Assign an available peer to a user."""
+    start = time.perf_counter()
+
     if not online_peers:
         return {"status": "no_peers"}
 
     assigned_peer = next(iter(online_peers))
-
     online_peers.remove(assigned_peer)
 
     pending_requests[assigned_peer] = data.user_id
 
-    return {
+    result = {
         "status": "pending",
         "peer_id": assigned_peer,
     }
 
+    end = time.perf_counter()
+    result["response_time"] = round((end - start) * 1000, 4)
+
+    return result
+
 
 @app.get("/peer/requests")
 def get_peer_requests(peer_id: str):
+    """Check if a peer has a pending request."""
     for chat in active_chats.values():
         if chat["peer_id"] == peer_id:
             return {"has_request": False}
@@ -126,11 +184,10 @@ def get_peer_requests(peer_id: str):
 
 @app.post("/match/accept")
 def accept_match(data: MatchAcceptRequest):
+    """Accept a match and create a chat session."""
     for chat in active_chats.values():
         if chat["peer_id"] == data.peer_id:
-            return {
-                "status": "already_in_chat"
-            }
+            return {"status": "already_in_chat"}
 
     chat_id = f"chat_{len(active_chats) + 1}"
 
@@ -141,13 +198,12 @@ def accept_match(data: MatchAcceptRequest):
 
     pending_requests.pop(data.peer_id, None)
 
-    return {
-        "chat_id": chat_id,
-    }
+    return {"chat_id": chat_id}
 
 
 @app.get("/match/status")
 def check_match_status(user_id: str):
+    """Check if a user has been matched."""
     for chat_id, chat in active_chats.items():
         if chat["user_id"] == user_id:
             return {
@@ -158,14 +214,13 @@ def check_match_status(user_id: str):
     return {"matched": False}
 
 
-
-class ChatMessageRequest(BaseModel):
-    chat_id: str
-    sender_id: str
-    text: str
+# Chat System
 
 @app.post("/chat/send")
 def send_message(data: ChatMessageRequest):
+    """Send a message in a chat session."""
+    start = time.perf_counter()
+
     if data.chat_id not in chat_messages:
         chat_messages[data.chat_id] = []
 
@@ -175,16 +230,25 @@ def send_message(data: ChatMessageRequest):
         "timestamp": datetime.utcnow().isoformat()
     })
 
-    return {"status": "sent"}
+    end = time.perf_counter()
+
+    return {
+        "status": "sent",
+        "response_time": round((end - start) * 1000, 4)
+    }
+
 
 @app.get("/chat/messages")
 def get_messages(chat_id: str):
+    """Retrieve all messages for a chat."""
     return {
         "messages": chat_messages.get(chat_id, [])
     }
 
+
 @app.post("/chat/end")
 def end_chat(data: EndChatRequest):
+    """End a chat session and free the peer."""
     chat = active_chats.get(data.chat_id)
 
     if not chat:
@@ -202,20 +266,15 @@ def end_chat(data: EndChatRequest):
         "peer_id": peer_id,
     }
 
-#feedback
 
-class FeedbackRequest(BaseModel):
-    chat_id: str
-    from_role: str 
-    rating: int
-    comment: str | None = None
-
+# Feedback System
 
 chat_feedback: dict[str, list[dict]] = {}
 
 
 @app.post("/chat/feedback")
 def submit_feedback(data: FeedbackRequest):
+    """Store feedback for a chat session."""
     if data.chat_id not in chat_feedback:
         chat_feedback[data.chat_id] = []
 

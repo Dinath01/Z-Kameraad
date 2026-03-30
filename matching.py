@@ -1,4 +1,7 @@
 def match_peer(burnout_level: int):
+    """
+    Determine the type of peer to match based on burnout level.
+    """
 
     if burnout_level == 2:
         return {

@@ -1,36 +1,42 @@
 from fastapi import APIRouter
 from pydantic import BaseModel
-from matching import match_peer
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from database import get_db
-from models import User
 
+from matching import match_peer
+from state import online_peers, pending_requests
+
+# Router for matching-related endpoints
 router = APIRouter()
 
+
+# Request model for general matching
 class MatchInput(BaseModel):
     burnout_level: int
 
+
 @router.post("/match")
 def match(input: MatchInput):
-    result = match_peer(input.burnout_level)
-    return result
+    """
+    Match a user with a peer based on burnout level.
+    """
+    return match_peer(input.burnout_level)
 
-from state import online_peers, pending_requests
 
 @router.post("/request-specific")
 def request_specific(data: dict):
+    """
+    Send a request to a specific peer if they are online.
+    """
     user_id = data.get("user_id")
     peer_id = data.get("peer_id")
 
-    # check if peer is online
+    # Check if the peer is available
     if peer_id not in online_peers:
         return {"status": "unavailable"}
 
-    # assign request
+    # Assign request to the selected peer
     pending_requests[peer_id] = user_id
 
-    # remove from available pool (same as broadcast)
+    # Remove peer from available pool
     online_peers.discard(peer_id)
 
     return {"status": "sent"}
